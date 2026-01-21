@@ -1,6 +1,8 @@
 import swisseph as swe
 from datetime import datetime
 import pytz
+
+# Set Lahiri ayanamsa for Vedic astrology
 swe.set_sid_mode(swe.SIDM_LAHIRI)
 
 def get_planetary_positions(date, time, latitude, longitude):

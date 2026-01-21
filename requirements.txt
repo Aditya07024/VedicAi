@@ -1,6 +1,6 @@
 streamlit
 python-dotenv
-swisseph
+pyswisseph
 pytz
 fpdf
 plotly
