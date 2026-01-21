@@ -332,9 +332,9 @@ with st.sidebar:
         st.markdown(f"[👉 Click here to search on Google]({search_url})")
         st.info(f"📌 **Instructions:**\n1. Click the link above to search '{place_name} latitude and longitude'\n2. Google will show the coordinates in the results\n3. Copy the latitude and longitude values\n4. Paste them in the fields below")
 
-    latitude = st.number_input("Latitude *", value=27.7081, format="%.4f", help="Latitude is required")
+    latitude = st.number_input("Latitude *", placeholder=27.7081, format="%.4f", help="Latitude is required")
 
-    longitude = st.number_input("Longitude *", value= 77.9367, format="%.4f", help="Longitude is required")
+    longitude = st.number_input("Longitude *", placeholder= 77.9367, format="%.4f", help="Longitude is required")
     
     st.markdown("---")
     
