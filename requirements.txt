@@ -1,0 +1,7 @@
+streamlit
+python-dotenv
+swisseph
+pytz
+fpdf
+plotly
+google-genai

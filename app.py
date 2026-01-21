@@ -2,6 +2,18 @@ import streamlit as st
 from datetime import datetime
 import sys
 import os
+from dotenv import load_dotenv
+load_dotenv()
+# Gemini import and config
+from google import genai
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+client = None
+if GEMINI_API_KEY:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    # Debug: API key not found
+    print("[WARNING] GEMINI_API_KEY not found in environment variables.")
 
 # Add paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +25,299 @@ from GenerateKundli import generate_kundli, generate_kundli_chart
 from doshaAnalyzer import detect_doshas
 from dashaCalculator import calculate_vimshottari_dasha
 from panchangCalculator import calculate_panchang
+
+
+# =========================
+# GEMINI AI EXPLANATION LAYER
+# (Used ONLY to explain already-calculated results)
+# =========================
+def generate_ai_explanation(analysis_type, data, kundli):
+    """
+    Gemini is used ONLY to explain already-calculated results
+    in simple, human-friendly language.
+    """
+
+    # ---- HARD QUOTA GUARD (Free tier protection) ----
+    if "gemini_calls_made" not in st.session_state:
+        st.session_state["gemini_calls_made"] = 0
+
+    MAX_GEMINI_CALLS = 3  # free tier safe limit per session
+
+    if st.session_state["gemini_calls_made"] >= MAX_GEMINI_CALLS:
+        return {
+            "explanation": (
+                "This insight is shown using rule‑based interpretation because "
+                "the daily AI explanation limit has been reached.\n\n"
+                "The guidance below is still accurate and derived from your "
+                "calculated chart."
+            ),
+            "raw_data": data,
+            "ai_generated": False,
+            "quota_exceeded": True
+        }
+
+    # ---- Streamlit cache to avoid repeated Gemini calls ----
+    cache_key = f"gemini_{analysis_type}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
+    if not client:
+        print("[DEBUG] No Gemini client available. Falling back to rule-based explanation.")
+        return {
+            "explanation": (
+                "This explanation is generated using rule-based logic because "
+                "Gemini AI is currently unavailable."
+            ),
+            "raw_data": data,
+            "ai_generated": False
+        }
+
+    # ---------- BUILD A COMPACT FACT SUMMARY FOR GEMINI ----------
+    facts = f"""
+ASTROLOGICAL FACTS (ALREADY CALCULATED – DO NOT RE-CALCULATE):
+
+Ascendant (Lagna): {kundli['lagna']['rashi']}
+Moon Sign: {kundli['planets']['Moon']['rashi']}
+
+PLANETARY PLACEMENTS (House : Planets):
+"""    
+
+    for house, planets in kundli["houses"].items():
+        if planets:
+            names = ", ".join(p["planet"] for p in planets)
+            facts += f"\nHouse {house}: {names}"
+
+    facts += f"""
+
+CURRENT DASHA:
+Mahadasha: {data.get('dasha', {}).get('mahadasha', {}).get('planet', 'N/A')}
+
+DOSHAS DETECTED:
+"""
+    doshas = data.get("doshas", [])
+    if doshas:
+        for d in doshas:
+            facts += f"\n- {d['name']} (Severity: {d['severity']})"
+    else:
+        facts += "\n- None"
+
+    if analysis_type == "career":
+        instruction = """
+TASK:
+Explain the person’s CAREER situation like a calm, experienced human astrologer
+talking to a client face‑to‑face.
+
+STYLE RULES:
+• No technical jargon
+• No predictions like “you WILL become”
+• Speak gently, practically, and clearly
+• 6–8 short sentences
+• Mention current phase, challenges, strengths, and next 6–12 months
+• End with ONE simple real‑life suggestion
+
+IMPORTANT:
+You are NOT calculating anything.
+You are ONLY explaining the facts above.
+"""
+
+    elif analysis_type == "dosha_summary":
+        instruction = """
+TASK:
+Explain the detected doshas in reassuring, everyday language.
+
+STYLE RULES:
+• Do NOT scare the user
+• Explain doshas as tendencies, not fate
+• Mention that time + awareness reduces impact
+• 5–6 sentences maximum
+• Tone: calm, supportive, human
+
+IMPORTANT:
+You are NOT predicting events.
+You are ONLY explaining the facts above.
+"""
+
+    elif analysis_type == "personality":
+        instruction = """
+TASK:
+Explain personality traits based on Lagna and Moon sign.
+
+STYLE:
+• Warm, human, relatable
+• 6–7 short sentences
+• Strengths + natural tendencies
+• Avoid labels or destiny talk
+"""
+
+    elif analysis_type == "marriage":
+        instruction = """
+TASK:
+Explain relationship and marriage tendencies.
+
+STYLE:
+• Reassuring, practical
+• 6–7 sentences
+• Mention emotional patterns, communication, patience
+"""
+
+    elif analysis_type == "life_phase":
+        instruction = """
+TASK:
+Explain the current life phase based on active Mahadasha.
+
+STYLE:
+• Calm guidance
+• 5–6 sentences
+• What this phase teaches, not predicts
+"""
+
+    elif analysis_type == "strengths_challenges":
+        instruction = """
+TASK:
+Explain strengths and challenges shown in the chart.
+
+STYLE:
+• Balanced tone
+• Strengths first, challenges second
+• Encourage awareness and effort
+"""
+
+    elif analysis_type == "health":
+        instruction = """
+TASK:
+Explain health and energy patterns.
+
+STYLE:
+• Gentle, non-medical
+• Energy levels, stress tendencies
+• Avoid disease prediction
+"""
+
+    elif analysis_type == "spiritual":
+        instruction = """
+TASK:
+Explain spiritual growth and inner development.
+
+STYLE:
+• Reflective and grounding
+• 5–6 sentences
+• Focus on awareness and balance
+"""
+
+    else:
+        return {
+            "explanation": "Explanation unavailable for this section.",
+            "raw_data": data,
+            "ai_generated": False
+        }
+
+    prompt = f"""
+You are a calm, experienced human Vedic astrology guide.
+Speak warmly and practically, like talking to a friend.
+
+{facts}
+
+{instruction}
+"""
+
+    try:
+        print("[DEBUG] Calling Gemini API for analysis type: " + analysis_type)
+        print("[DEBUG] Using model: gemini-3-flash-preview (official docs safe)")
+
+        # ---- BATCHING / QUOTA COUNT ----
+        st.session_state["gemini_calls_made"] += 1
+
+        # Use Gemini 3 Flash Preview model (official docs safe) with retry
+        import time
+        try:
+            response = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt
+            )
+        except Exception as first_error:
+            print("[WARN] Gemini temporary failure, retrying once...")
+            time.sleep(2)
+            response = client.models.generate_content(
+                model="gemini-3-flash-preview",
+                contents=prompt
+            )
+
+        print(f"[DEBUG] Gemini response received: {len(response.text)} characters")
+
+        result = {
+            "explanation": response.text.strip(),
+            "raw_data": data,
+            "ai_generated": True,
+            "model": "gemini-3-flash-preview"
+        }
+        st.session_state[cache_key] = result
+        return result
+
+    except Exception as e:
+        print(f"[ERROR] Gemini API call failed: {type(e).__name__}: {str(e)}")
+        import traceback
+        print(f"[ERROR] Full traceback: {traceback.format_exc()}")
+        fallback = {
+            "explanation": (
+                "This explanation is generated using rule-based logic because "
+                "Gemini AI is temporarily unavailable.\n\n"
+                "Based on your chart, the current period reflects responsibility, "
+                "learning, and gradual progress. Results improve with consistency "
+                "over the next few months. Any doshas indicate areas needing patience, "
+                "not fear."
+            ),
+            "raw_data": data,
+            "ai_generated": False,
+            "error": str(e)
+        }
+        st.session_state[cache_key] = fallback
+        return fallback
+
+def get_house_summary(kundli, house_num):
+    """
+    Return a readable summary of planets in a given house.
+    Used ONLY for AI explanations.
+    """
+    planets = kundli["houses"].get(house_num, [])
+    if not planets:
+        return "Empty"
+    return ", ".join(p["planet"] for p in planets)
+
+
+# =========================
+# REUSABLE AI INSIGHT RENDERER
+# =========================
+def render_ai_insight(title, analysis_type, data, kundli, expanded=False):
+    """
+    Renders a single AI insight section with:
+    - Spinner
+    - Gemini explanation
+    - Red highlighted output
+    """
+    with st.expander(title, expanded=expanded):
+        with st.spinner("🤖 Generating insight (human‑friendly summary)..."):
+            insight = generate_ai_explanation(
+                analysis_type,
+                data,
+                kundli
+            )
+
+        st.markdown(
+            f"""
+            <div style="
+                border-left: 6px solid #dc2626;
+                background-color: #fef2f2;
+                padding: 16px;
+                border-radius: 8px;
+                font-size: 1rem;
+                line-height: 1.6;
+            ">
+            <strong>🤖 Gemini Explanation</strong><br><br>
+            {insight['explanation']}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 # Page config
 st.set_page_config(
@@ -64,12 +369,64 @@ st.markdown("""
 # Header
 st.markdown('<h1 class="main-header">🔮 VedicAI</h1>', unsafe_allow_html=True)
 st.markdown('<p class="sub-header">Explainable Astrology through Astronomical Computation</p>', unsafe_allow_html=True)
+st.markdown(
+    '''
+    <div style="
+        text-align:center;
+        margin-bottom: 1.5rem;
+        padding: 12px 16px;
+        background: #fff7ed;
+        border: 2px solid #fb923c;
+        border-radius: 10px;
+        font-size: 1rem;
+        color: #9a3412;
+        font-weight: 500;
+    ">
+        🚀 <strong>Developed by Aditya</strong> <br/>
+        💬 Feedback
+        <a href="https://www.linkedin.com/in/adityakumar0702/" target="_blank"
+           style="color:#c2410c; text-decoration: underline; font-weight:600;">
+                Message me on LinkedIn
+        </a>
+        <br>
+        Source Code:
+        <a href="https://github.com/Aditya07024" target="_blank"
+           style="color:#c2410c; text-decoration: underline; font-weight:600;">
+                github.com/Aditya07024
+        </a>
+    </div>
+    ''',
+    unsafe_allow_html=True
+)
+
+# Centered GitHub button just below banner
+st.markdown(
+    """
+    <div style="text-align:center; margin-bottom: 2rem;">
+        <a href="https://github.com/Aditya07024" target="_blank">
+            <button style="
+                background-color:#dc2626;
+                color:white;
+                border:none;
+                padding:14px 22px;
+                font-size:1rem;
+                border-radius:10px;
+                cursor:pointer;
+                font-weight:600;
+            ">
+                📘 How to Use This App
+            </button>
+        </a>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 # Sidebar - Input Form
 with st.sidebar:
     st.header("📅 Birth Details")
     
-    name = st.text_input("Name (Optional)", placeholder="John Doe")
+    name = st.text_input("Name", placeholder="John Doe")
     
     birth_date = st.date_input(
         "Birth Date",
@@ -84,33 +441,13 @@ with st.sidebar:
     )
     
     st.subheader("📍 Birth Place")
-    
-    # Location presets
-    location_preset = st.selectbox(
-        "Quick Select",
-        ["Custom", "Delhi", "Mumbai", "Bangalore", "Chennai", "Kolkata", "Hyderabad"]
-    )
-    
-    location_map = {
-        "Delhi": {"latitude": 28.6139, "longitude": 77.2090},
-        "Mumbai": {"latitude": 19.0760, "longitude": 72.8777},
-        "Bangalore": {"latitude": 12.9716, "longitude": 77.5946},
-        "Chennai": {"latitude": 13.0827, "longitude": 80.2707},
-        "Kolkata": {"latitude": 22.5726, "longitude": 88.3639},
-        "Hyderabad": {"latitude": 17.3850, "longitude": 78.4867}
-    }
-    
-    if location_preset != "Custom":
-        default_lat = location_map[location_preset]["latitude"]
-        default_lon = location_map[location_preset]["longitude"]
-        place_name = location_preset
-    else:
-        default_lat = 28.6139
-        default_lon = 77.2090
-        place_name = st.text_input("Place Name", value="Delhi")
-    
-    latitude = st.number_input("Latitude", value=default_lat, format="%.4f")
-    longitude = st.number_input("Longitude", value=default_lon, format="%.4f")
+
+    st.info("ℹ️ Please manually enter the latitude and longitude of your birth place for accurate results.")
+
+    place_name = st.text_input("Place Name", value="Delhi")
+
+    latitude = st.number_input("Latitude", value=28.6139, format="%.4f")
+    longitude = st.number_input("Longitude", value=77.2090, format="%.4f")
     
     st.markdown("---")
     generate_btn = st.button("🔮 Generate Analysis", type="primary", use_container_width=True)
@@ -171,12 +508,15 @@ if generate_btn or 'analysis_done' in st.session_state:
     st.success(f"✅ Analysis complete for {birth_details['name']}")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab6, tab7 = st.tabs([
         "📊 Kundli Chart", 
         "⚠️ Dosha Analysis", 
         "⏰ Dasha Periods", 
         "📅 Panchang",
+        # "🧠 Explanation",
+"🤖 AI-Powered Insights",
         "🔍 Why This Prediction?"
+        
     ])
     
     # TAB 1: Kundli Chart
@@ -186,26 +526,33 @@ if generate_btn or 'analysis_done' in st.session_state:
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            # Display chart
+            # Display North Indian (diamond-style) chart
             h = kundli_chart["house_chart"]
             lagna = kundli_chart["lagna"]
-            
-            chart_text = f"""
-                 [10] {h[10]}
-        -----------------------------
-        | [11] {h[11]:<12} | [9] {h[9]:<12} |
-        |-----------------------------|
-        | [12] {h[12]:<12} | [8] {h[8]:<12} |
-        -----------------------------
-     [1] {h[1]:<12}    LAGNA ({lagna})    [7] {h[7]:<12}
-        -----------------------------
-        | [2] {h[2]:<12} | [6] {h[6]:<12} |
-        |-----------------------------|
-        | [3] {h[3]:<12} | [5] {h[5]:<12} |
-        -----------------------------
-                     [4] {h[4]}
+
+            north_indian_chart = f"""
+                ┌───────────────┐
+                │  [12] {h[12]:<12} │
+        ┌───────┼───────────────┼───────┐
+        │ [11] {h[11]:<8} │               │ [1] {h[1]:<8} │
+        │               │   LAGNA        │               │
+        │               │ ({lagna})      │               │
+        ├───────────────┼───────────────┼───────────────┤
+        │ [10] {h[10]:<8} │               │ [2] {h[2]:<8} │
+        │               │               │               │
+        └───────┼───────────────┼───────┘
+                │  [7] {h[7]:<12} │
+        ┌───────┼───────────────┼───────┐
+        │ [8] {h[8]:<8} │               │ [6] {h[6]:<8} │
+        │               │               │               │
+        ├───────────────┼───────────────┼───────────────┤
+        │ [9] {h[9]:<8} │               │ [5] {h[5]:<8} │
+        │               │               │               │
+        └───────┼───────────────┼───────┘
+                │  [4] {h[4]:<12} │
+                └───────────────┘
             """
-            st.code(chart_text, language="text")
+            st.code(north_indian_chart, language="text")
         
         with col2:
             st.markdown("### 📋 Birth Details")
@@ -360,9 +707,70 @@ if generate_btn or 'analysis_done' in st.session_state:
             st.write(f"**Sunset:** {panchang['sunset']}")
             st.write(f"**Rahu Kaal:** Period {panchang['rahu_kaal']['period_index']}")
             st.caption(panchang['rahu_kaal']['note'])
+
+    # TAB 5: Explanation (Gemini)
+    # with tab5:
+    #     st.subheader("🧠 Explanation (Human-Friendly Interpretation)")
+        
+    #     st.info("""
+    #     🔴 **Important:**  
+    #     This section is generated using **Gemini AI**.  
+    #     Gemini does **NOT** calculate planets, doshas, or dashas.  
+    #     It only **explains the already-calculated results** in simple language.
+    #     """)
+
+    #     # Career Explanation
+    #     with st.expander("💼 Career Explanation", expanded=True):
+    #         career_data = {
+    #             'dasha': dasha,
+    #             'doshas': doshas,
+    #             'tenth_house': kundli['houses'][10]
+    #         }
+            
+    #         career_exp = generate_ai_explanation("career", career_data, kundli)
+            
+    #         st.markdown(
+    #             f"""
+    #             <div style="
+    #                 border-left: 6px solid #dc2626;
+    #                 background-color: #fef2f2;
+    #                 padding: 16px;
+    #                 border-radius: 8px;
+    #             ">
+    #             <strong>🤖 Gemini Explanation</strong><br><br>
+    #             {career_exp['explanation']}
+    #             </div>
+    #             """,
+    #             unsafe_allow_html=True
+    #         )
+
+    #     # Dosha Explanation
+    #     with st.expander("⚠️ Dosha Explanation"):
+    #         dosha_exp = generate_ai_explanation(
+    #             "dosha_summary",
+    #             {'doshas': doshas},
+    #             kundli
+    #         )
+            
+    #         st.markdown(
+    #             f"""
+    #             <div style="
+    #                 border-left: 6px solid #dc2626;
+    #                 background-color: #fef2f2;
+    #                 padding: 16px;
+    #                 border-radius: 8px;
+    #             ">
+    #             <strong>🤖 Gemini Explanation</strong><br><br>
+    #             {dosha_exp['explanation']}
+    #             </div>
+    #             """,
+    #             unsafe_allow_html=True
+    #         )
+
+    #     st.caption("🧠 Gemini is used only for explanation — all astrology is rule-based and reproducible.")
     
-    # TAB 5: Transparency
-    with tab5:
+    # TAB 6: Transparency
+    with tab7:
         st.subheader("🔍 How We Generated This Prediction")
         
         st.markdown("""
@@ -450,6 +858,79 @@ Current Mahadasha: {maha['planet']} ({maha['start_date']} to {maha['end_date']})
         We do not claim astrology is scientifically proven - we aim to make 
         traditional practices **consistent, transparent, and accessible**.
         """)
+
+    # TAB 7: AI-Powered Insights
+    with tab6:
+        st.subheader("🤖 AI-Powered Insights")
+
+        st.warning("""
+⚠️ **AI Usage Notice**
+
+Gemini AI has a **daily free‑tier limit**.
+Only the **most important insights** are generated using AI.
+
+Other insights automatically fall back to **rule‑based human explanations**
+to keep the app fast, stable, and reliable.
+""")
+
+        render_ai_insight(
+            "🌟 Personality Insight",
+            "personality",
+            {"dasha": dasha, "doshas": doshas},
+            kundli
+        )
+
+        render_ai_insight(
+            "💼 Career Outlook",
+            "career",
+            {"dasha": dasha, "doshas": doshas},
+            kundli,
+            expanded=True
+        )
+
+        render_ai_insight(
+            "💑 Relationships & Marriage",
+            "marriage",
+            {"dasha": dasha, "doshas": doshas},
+            kundli
+        )
+
+        render_ai_insight(
+            "⏳ Current Life Phase",
+            "life_phase",
+            {"dasha": dasha, "doshas": doshas},
+            kundli
+        )
+
+        render_ai_insight(
+            "💪 Strengths & Challenges",
+            "strengths_challenges",
+            {"dasha": dasha, "doshas": doshas},
+            kundli
+        )
+
+        render_ai_insight(
+            "🧘 Health & Energy",
+            "health",
+            {"dasha": dasha, "doshas": doshas},
+            kundli
+        )
+
+        render_ai_insight(
+            "🕉️ Spiritual Growth",
+            "spiritual",
+            {"dasha": dasha, "doshas": doshas},
+            kundli
+        )
+
+        render_ai_insight(
+            "⚠️ Dosha Impact Summary",
+            "dosha_summary",
+            {"doshas": doshas},
+            kundli
+        )
+
+        st.caption("🧠 Gemini explains only — all astrology is rule-based and reproducible.")
 
 else:
     # Welcome screen
