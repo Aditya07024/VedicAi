@@ -12,3 +12,19 @@ __pycache__/
 .streamlit/
 
 .env
+
+# Node
+frontend/node_modules/
+node_modules/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Env files
+.env
+
+# Build output
+frontend/dist/
+frontend/build/
