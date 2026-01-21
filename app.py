@@ -302,7 +302,22 @@ with st.sidebar:
     
     st.subheader("📍 Birth Place")
 
-    st.info("ℹ️ After entering the birth place click on search icon.")
+    st.markdown(
+    """
+    <div style="
+        background-color:#fee2e2;
+        border-left:6px solid #dc2626;
+        padding:10px 12px;
+        border-radius:8px;
+        color:#7f1d1d;
+        font-weight:600;
+        font-size:0.95rem;
+    ">
+        ℹ️ After entering the birth place click on search icon.
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
     col1, col2 = st.columns([4, 1])
     with col1:
