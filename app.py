@@ -6,6 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 # Gemini import and config
 from google import genai
+import psycopg2
+from psycopg2.extras import Json
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 client = None
@@ -28,296 +30,154 @@ from panchangCalculator import calculate_panchang
 
 
 # =========================
-# GEMINI AI EXPLANATION LAYER
-# (Used ONLY to explain already-calculated results)
+# Database Save Function: Save Raw Data to PostgreSQL
 # =========================
-def generate_ai_explanation(analysis_type, data, kundli):
-    """
-    Gemini is used ONLY to explain already-calculated results
-    in simple, human-friendly language.
-    """
+def get_db_connection():
+    try:
+        # Use DATABASE_URL from Neon or fall back to individual env vars
+        database_url = os.getenv("DATABASE_URL")
+        if database_url:
+            conn = psycopg2.connect(database_url)
+        else:
+            conn = psycopg2.connect(
+                dbname=os.getenv("POSTGRES_DB"),
+                user=os.getenv("POSTGRES_USER"),
+                password=os.getenv("POSTGRES_PASSWORD"),
+                host=os.getenv("POSTGRES_HOST", "localhost"),
+                port=os.getenv("POSTGRES_PORT", 5432)
+            )
+        return conn
+    except Exception as e:
+        print("[ERROR] Failed to connect to PostgreSQL:", e)
+        return None
 
-    # ---- HARD QUOTA GUARD (Free tier protection) ----
-    if "gemini_calls_made" not in st.session_state:
-        st.session_state["gemini_calls_made"] = 0
 
-    MAX_GEMINI_CALLS = 3  # free tier safe limit per session
+def save_raw_data_to_db(payload):
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vedicai_raw_data (
+                id SERIAL PRIMARY KEY,
+                user_name TEXT,
+                birth_details JSONB,
+                kundli_data JSONB,
+                dosha_data JSONB,
+                dasha_data JSONB,
+                panchang_data JSONB,
+                ai_insights JSONB,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # Extract user_name from birth_details
+        birth_details = payload.get('birth_details', {})
+        user_name = birth_details.get('name', 'Unknown User')
+        
+        cur.execute(
+            """INSERT INTO vedicai_raw_data 
+               (user_name, birth_details, kundli_data, dosha_data, dasha_data, panchang_data, ai_insights) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (
+                user_name,
+                Json(birth_details),
+                Json(payload.get('kundli_data')),
+                Json(payload.get('dosha_data')),
+                Json(payload.get('dasha_data')),
+                Json(payload.get('panchang_data')),
+                Json(payload.get('ai_insights'))
+            )
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("[INFO] Raw data saved to PostgreSQL")
+        return True
+    except Exception as e:
+        print("[ERROR] Failed to save raw data:", e)
+        return False
 
-    if st.session_state["gemini_calls_made"] >= MAX_GEMINI_CALLS:
-        return {
-            "explanation": (
-                "This insight is shown using rule‑based interpretation because "
-                "the daily AI explanation limit has been reached.\n\n"
-                "The guidance below is still accurate and derived from your "
-                "calculated chart."
-            ),
-            "raw_data": data,
-            "ai_generated": False,
-            "quota_exceeded": True
-        }
 
-    # ---- Streamlit cache to avoid repeated Gemini calls ----
-    cache_key = f"gemini_{analysis_type}"
-    if cache_key in st.session_state:
-        return st.session_state[cache_key]
+
+# =========================
+# MASTER GEMINI INSIGHT (single call, multi-section)
+# =========================
+def generate_master_ai_insight(data, kundli):
+    print("[INFO] Starting Gemini AI master insight generation...")
+    if "ai_master_insight" in st.session_state:
+        return st.session_state["ai_master_insight"]
 
     if not client:
-        print("[DEBUG] No Gemini client available. Falling back to rule-based explanation.")
-        return {
-            "explanation": (
-                "This explanation is generated using rule-based logic because "
-                "Gemini AI is currently unavailable."
-            ),
-            "raw_data": data,
-            "ai_generated": False
-        }
-
-    # ---------- BUILD A COMPACT FACT SUMMARY FOR GEMINI ----------
-    facts = f"""
-ASTROLOGICAL FACTS (ALREADY CALCULATED – DO NOT RE-CALCULATE):
-
-Ascendant (Lagna): {kundli['lagna']['rashi']}
-Moon Sign: {kundli['planets']['Moon']['rashi']}
-
-PLANETARY PLACEMENTS (House : Planets):
-"""    
-
-    for house, planets in kundli["houses"].items():
-        if planets:
-            names = ", ".join(p["planet"] for p in planets)
-            facts += f"\nHouse {house}: {names}"
-
-    facts += f"""
-
-CURRENT DASHA:
-Mahadasha: {data.get('dasha', {}).get('mahadasha', {}).get('planet', 'N/A')}
-
-DOSHAS DETECTED:
-"""
-    doshas = data.get("doshas", [])
-    if doshas:
-        for d in doshas:
-            facts += f"\n- {d['name']} (Severity: {d['severity']})"
-    else:
-        facts += "\n- None"
-
-    if analysis_type == "career":
-        instruction = """
-TASK:
-Explain the person’s CAREER situation like a calm, experienced human astrologer
-talking to a client face‑to‑face.
-
-STYLE RULES:
-• No technical jargon
-• No predictions like “you WILL become”
-• Speak gently, practically, and clearly
-• 6–8 short sentences
-• Mention current phase, challenges, strengths, and next 6–12 months
-• End with ONE simple real‑life suggestion
-
-IMPORTANT:
-You are NOT calculating anything.
-You are ONLY explaining the facts above.
-"""
-
-    elif analysis_type == "dosha_summary":
-        instruction = """
-TASK:
-Explain the detected doshas in reassuring, everyday language.
-
-STYLE RULES:
-• Do NOT scare the user
-• Explain doshas as tendencies, not fate
-• Mention that time + awareness reduces impact
-• 5–6 sentences maximum
-• Tone: calm, supportive, human
-
-IMPORTANT:
-You are NOT predicting events.
-You are ONLY explaining the facts above.
-"""
-
-    elif analysis_type == "personality":
-        instruction = """
-TASK:
-Explain personality traits based on Lagna and Moon sign.
-
-STYLE:
-• Warm, human, relatable
-• 6–7 short sentences
-• Strengths + natural tendencies
-• Avoid labels or destiny talk
-"""
-
-    elif analysis_type == "marriage":
-        instruction = """
-TASK:
-Explain relationship and marriage tendencies.
-
-STYLE:
-• Reassuring, practical
-• 6–7 sentences
-• Mention emotional patterns, communication, patience
-"""
-
-    elif analysis_type == "life_phase":
-        instruction = """
-TASK:
-Explain the current life phase based on active Mahadasha.
-
-STYLE:
-• Calm guidance
-• 5–6 sentences
-• What this phase teaches, not predicts
-"""
-
-    elif analysis_type == "strengths_challenges":
-        instruction = """
-TASK:
-Explain strengths and challenges shown in the chart.
-
-STYLE:
-• Balanced tone
-• Strengths first, challenges second
-• Encourage awareness and effort
-"""
-
-    elif analysis_type == "health":
-        instruction = """
-TASK:
-Explain health and energy patterns.
-
-STYLE:
-• Gentle, non-medical
-• Energy levels, stress tendencies
-• Avoid disease prediction
-"""
-
-    elif analysis_type == "spiritual":
-        instruction = """
-TASK:
-Explain spiritual growth and inner development.
-
-STYLE:
-• Reflective and grounding
-• 5–6 sentences
-• Focus on awareness and balance
-"""
-
-    else:
-        return {
-            "explanation": "Explanation unavailable for this section.",
-            "raw_data": data,
-            "ai_generated": False
-        }
+        return None
 
     prompt = f"""
-You are a calm, experienced human Vedic astrology guide.
-Speak warmly and practically, like talking to a friend.
+You are a calm, experienced Vedic astrologer speaking to a client.
 
-{facts}
+Use ONLY the facts below. Do NOT calculate anything new.
+Write deep, human-friendly explanations (not generic).
 
-{instruction}
+FORMAT EXACTLY LIKE THIS:
+
+PERSONALITY:
+<6-8 natural sentences>
+
+CAREER:
+<6-8 sentences + one practical real-life suggestion>
+
+RELATIONSHIPS:
+<6-8 sentences>
+
+LIFE_PHASE:
+<5-6 sentences>
+
+STRENGTHS_CHALLENGES:
+<balanced paragraph>
+
+HEALTH:
+<gentle non-medical explanation>
+
+SPIRITUAL:
+<grounding reflective paragraph>
+
+DOSHA_SUMMARY:
+<reassuring explanation>
+
+FACTS:
+Ascendant: {kundli['lagna']['rashi']}
+Moon Sign: {kundli['planets']['Moon']['rashi']}
+Current Mahadasha: {data['dasha']['mahadasha']['planet']}
+Doshas: {", ".join(d['name'] for d in data['doshas']) or "None"}
 """
 
     try:
-        print("[DEBUG] Calling Gemini API for analysis type: " + analysis_type)
-        print("[DEBUG] Using model: gemini-3-flash-preview (official docs safe)")
+        print("[INFO] Sending prompt to Gemini model...")
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=prompt
+        )
+        print("[INFO] Gemini AI response received, parsing sections...")
 
-        # ---- BATCHING / QUOTA COUNT ----
-        st.session_state["gemini_calls_made"] += 1
+        # Check if response has content
+        if not response or not response.text:
+            print("[ERROR] Gemini API returned empty response")
+            return {}
+        
+        sections = {}
+        current = None
+        for line in response.text.splitlines():
+            if line.strip().endswith(":") and line.strip().isupper():
+                current = line.strip()[:-1]
+                sections[current] = ""
+            elif current:
+                sections[current] += line + "\n"
 
-        # Use Gemini 3 Flash Preview model (official docs safe) with retry
-        import time
-        try:
-            response = client.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt
-            )
-        except Exception as first_error:
-            print("[WARN] Gemini temporary failure, retrying once...")
-            time.sleep(2)
-            response = client.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt
-            )
-
-        print(f"[DEBUG] Gemini response received: {len(response.text)} characters")
-
-        result = {
-            "explanation": response.text.strip(),
-            "raw_data": data,
-            "ai_generated": True,
-            "model": "gemini-3-flash-preview"
-        }
-        st.session_state[cache_key] = result
-        return result
+        st.session_state["ai_master_insight"] = sections
+        return sections
 
     except Exception as e:
-        print(f"[ERROR] Gemini API call failed: {type(e).__name__}: {str(e)}")
-        import traceback
-        print(f"[ERROR] Full traceback: {traceback.format_exc()}")
-        fallback = {
-            "explanation": (
-                "This explanation is generated using rule-based logic because "
-                "Gemini AI is temporarily unavailable.\n\n"
-                "Based on your chart, the current period reflects responsibility, "
-                "learning, and gradual progress. Results improve with consistency "
-                "over the next few months. Any doshas indicate areas needing patience, "
-                "not fear."
-            ),
-            "raw_data": data,
-            "ai_generated": False,
-            "error": str(e)
-        }
-        st.session_state[cache_key] = fallback
-        return fallback
-
-def get_house_summary(kundli, house_num):
-    """
-    Return a readable summary of planets in a given house.
-    Used ONLY for AI explanations.
-    """
-    planets = kundli["houses"].get(house_num, [])
-    if not planets:
-        return "Empty"
-    return ", ".join(p["planet"] for p in planets)
-
-
-# =========================
-# REUSABLE AI INSIGHT RENDERER
-# =========================
-def render_ai_insight(title, analysis_type, data, kundli, expanded=False):
-    """
-    Renders a single AI insight section with:
-    - Spinner
-    - Gemini explanation
-    - Red highlighted output
-    """
-    with st.expander(title, expanded=expanded):
-        with st.spinner("🤖 Generating insight (human‑friendly summary)..."):
-            insight = generate_ai_explanation(
-                analysis_type,
-                data,
-                kundli
-            )
-
-        st.markdown(
-            f"""
-            <div style="
-                border-left: 6px solid #dc2626;
-                background-color: #fef2f2;
-                padding: 16px;
-                border-radius: 8px;
-                font-size: 1rem;
-                line-height: 1.6;
-            ">
-            <strong>🤖 Gemini Explanation</strong><br><br>
-            {insight['explanation']}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        print("[ERROR] Gemini AI failed:", e)
+        return {}
 
 # Page config
 st.set_page_config(
@@ -426,31 +286,55 @@ st.markdown(
 with st.sidebar:
     st.header("📅 Birth Details")
     
-    name = st.text_input("Name", placeholder="John Doe")
+    name = st.text_input("Name *", placeholder="John Doe", help="Username is required")
     
     birth_date = st.date_input(
         "Birth Date",
-        value=datetime(1995, 8, 15),
+        value=datetime(2003, 2, 7),
         min_value=datetime(1900, 1, 1),
         max_value=datetime.now()
     )
     
     birth_time = st.time_input(
         "Birth Time",
-        value=datetime.strptime("10:30", "%H:%M").time()
+        value=datetime.strptime("3:00", "%H:%M").time()
     )
     
     st.subheader("📍 Birth Place")
 
-    st.info("ℹ️ Please manually enter the latitude and longitude of your birth place for accurate results.")
+    st.info("ℹ️ After entering the birth place click on search icon.")
 
-    place_name = st.text_input("Place Name", value="Delhi")
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        place_name = st.text_input("Place Name *", placeholder="Enter your birth place", help="Place name is required")
+    with col2:
+        st.write("")  # Spacing
+        search_btn = st.button("🔍", help="Search for place coordinates on Google")
+    
+    if search_btn and place_name:
+        # Open Google search for latitude and longitude
+        search_url = f"https://www.google.com/search?q={place_name.replace(' ', '+')}+latitude+and+longitude"
+        st.markdown(f"[👉 Click here to search on Google]({search_url})")
+        st.info(f"📌 **Instructions:**\n1. Click the link above to search '{place_name} latitude and longitude'\n2. Google will show the coordinates in the results\n3. Copy the latitude and longitude values\n4. Paste them in the fields below")
 
-    latitude = st.number_input("Latitude", value=28.6139, format="%.4f")
-    longitude = st.number_input("Longitude", value=77.2090, format="%.4f")
+    latitude = st.number_input("Latitude *", value=27.7081, format="%.4f", help="Latitude is required")
+
+    longitude = st.number_input("Longitude *", value= 77.9367, format="%.4f", help="Longitude is required")
     
     st.markdown("---")
-    generate_btn = st.button("🔮 Generate Analysis", type="primary", use_container_width=True)
+    
+    # Validate all required fields
+    is_form_valid = (
+        name and name.strip() != "" and
+        place_name and place_name.strip() != "Enter your birth place" and
+        latitude != 0 and
+        longitude != 0
+    )
+    
+    generate_btn = st.button("🔮 Generate Analysis", type="primary", use_container_width=True, disabled=not is_form_valid)
+    
+    if not is_form_valid:
+        st.warning("⚠️ Please fill all required fields marked with *")
 
 # Main content
 if generate_btn or 'analysis_done' in st.session_state:
@@ -489,12 +373,26 @@ if generate_btn or 'analysis_done' in st.session_state:
             st.session_state['dasha'] = dasha
             st.session_state['panchang'] = panchang
             st.session_state['birth_details'] = {
-                'name': name if name else "User",
+                'name': name,
                 'date': birth_date.strftime("%d %B %Y"),
                 'time': birth_time.strftime("%I:%M %p"),
-                'place': place_name
+                'place': place_name,
+                'latitude': latitude,
+                'longitude': longitude
             }
             st.session_state['analysis_done'] = True
+            
+            # Auto-save raw data to database
+            payload = {
+                "birth_details": st.session_state['birth_details'],
+                "kundli_data": kundli,
+                "dosha_data": doshas,
+                "dasha_data": dasha,
+                "panchang_data": panchang,
+                "ai_insights": {}
+            }
+            save_raw_data_to_db(payload)
+            st.success(f"✅ Data generated for {name}")
     
     # Retrieve from session state
     kundli = st.session_state.get('kundli')
@@ -508,15 +406,15 @@ if generate_btn or 'analysis_done' in st.session_state:
     st.success(f"✅ Analysis complete for {birth_details['name']}")
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab6, tab7, tab8 = st.tabs([
         "📊 Kundli Chart", 
         "⚠️ Dosha Analysis", 
         "⏰ Dasha Periods", 
         "📅 Panchang",
         # "🧠 Explanation",
-"🤖 AI-Powered Insights",
-        "🔍 Why This Prediction?"
-        
+        "🤖 AI-Powered Insights",
+        "🔍 Why This Prediction?",
+        "🧾 Raw Data"
     ])
     
     # TAB 1: Kundli Chart
@@ -873,64 +771,76 @@ Other insights automatically fall back to **rule‑based human explanations**
 to keep the app fast, stable, and reliable.
 """)
 
-        render_ai_insight(
-            "🌟 Personality Insight",
-            "personality",
-            {"dasha": dasha, "doshas": doshas},
-            kundli
-        )
+        with st.spinner("🤖 Generating deep AI insights (this may take a few seconds)..."):
+            print("[UI] Spinner shown: Generating AI insights")
+            insights = generate_master_ai_insight(
+                {"dasha": dasha, "doshas": doshas},
+                kundli
+            )
+            print("[UI] Spinner finished")
 
-        render_ai_insight(
-            "💼 Career Outlook",
-            "career",
-            {"dasha": dasha, "doshas": doshas},
-            kundli,
-            expanded=True
-        )
 
-        render_ai_insight(
-            "💑 Relationships & Marriage",
-            "marriage",
-            {"dasha": dasha, "doshas": doshas},
-            kundli
-        )
+        def show_section(title, key):
+            with st.expander(title, expanded=(key=="CAREER")):
+                if insights and key in insights:
+                    full_text = insights[key].strip()
+                    # --- Summary generation (first 2–3 meaningful lines) ---
+                    lines = [l for l in full_text.splitlines() if l.strip()]
+                    summary = " ".join(lines[:2])
 
-        render_ai_insight(
-            "⏳ Current Life Phase",
-            "life_phase",
-            {"dasha": dasha, "doshas": doshas},
-            kundli
-        )
+                    style_block = """
+    background:#fff1f2;
+    border-left:6px solid #dc2626;
+    color:#7f1d1d;
+    padding:14px;
+    border-radius:10px;
+    font-size:0.95rem;
+""" if key == "DOSHA_SUMMARY" else """
+    background:#f0f9ff;
+    border-left:5px solid #0ea5e9;
+    padding:12px;
+    border-radius:8px;
+    font-size:0.95rem;
+"""
 
-        render_ai_insight(
-            "💪 Strengths & Challenges",
-            "strengths_challenges",
-            {"dasha": dasha, "doshas": doshas},
-            kundli
-        )
+                    st.markdown(
+                        f'''
+    <div style="{style_block}">
+        <strong>📝 Insight Summary:</strong><br/>
+        {summary}
+    </div>
+    ''',
+                        unsafe_allow_html=True
+                    )
+                    st.markdown("")
+                else:
+                    st.info("This insight is shown using detailed rule-based interpretation because AI service is temporarily unavailable.")
 
-        render_ai_insight(
-            "🧘 Health & Energy",
-            "health",
-            {"dasha": dasha, "doshas": doshas},
-            kundli
-        )
-
-        render_ai_insight(
-            "🕉️ Spiritual Growth",
-            "spiritual",
-            {"dasha": dasha, "doshas": doshas},
-            kundli
-        )
-
-        render_ai_insight(
-            "⚠️ Dosha Impact Summary",
-            "dosha_summary",
-            {"doshas": doshas},
-            kundli
-        )
+        show_section("🌟 Personality Insight", "PERSONALITY")
+        show_section("💼 Career Outlook", "CAREER")
+        show_section("💑 Relationships & Marriage", "RELATIONSHIPS")
+        show_section("⏳ Current Life Phase", "LIFE_PHASE")
+        show_section("💪 Strengths & Challenges", "STRENGTHS_CHALLENGES")
+        show_section("🧘 Health & Energy", "HEALTH")
+        show_section("🕉️ Spiritual Growth", "SPIRITUAL")
+        show_section("⚠️ Dosha Impact Summary", "DOSHA_SUMMARY")
 
         st.caption("🧠 Gemini explains only — all astrology is rule-based and reproducible.")
+
+    # TAB 8: Raw Data (JSON)
+    with tab8:
+        st.subheader("🧾 Raw Calculated Data (JSON)")
+        st.info(
+            "This section displays the **exact underlying data** used for all insights above. "
+            "You can use this to reproduce every calculation — nothing is hidden or changed.\n\n"
+        )
+        st.json({
+            "birth_details": birth_details,
+            "kundli": kundli,
+            "doshas": doshas,
+            "dasha": dasha,
+            "panchang": panchang
+        })
 
 else:
     # Welcome screen
