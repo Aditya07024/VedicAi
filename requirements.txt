@@ -5,3 +5,4 @@ pytz
 fpdf
 plotly
 google-genai
+huggingface-hub>=0.20.0

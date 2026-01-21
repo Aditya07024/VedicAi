@@ -4,16 +4,9 @@ import sys
 import os
 from dotenv import load_dotenv
 load_dotenv()
-# Gemini import and config
-from google import genai
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-client = None
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    # Debug: API key not found
-    print("[WARNING] GEMINI_API_KEY not found in environment variables.")
+from huggingface_hub import InferenceClient
+
 
 # Add paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,251 +20,163 @@ from dashaCalculator import calculate_vimshottari_dasha
 from panchangCalculator import calculate_panchang
 
 
-# =========================
-# GEMINI AI EXPLANATION LAYER
-# (Used ONLY to explain already-calculated results)
-# =========================
+
+@st.cache_resource
+def load_hf_client():
+    return InferenceClient(
+        api_key=os.environ.get("HF_TOKEN")
+    )
+
+hf_client = load_hf_client()
+
 def generate_ai_explanation(analysis_type, data, kundli):
-    """
-    Gemini is used ONLY to explain already-calculated results
-    in simple, human-friendly language.
-    """
-
-    # ---- HARD QUOTA GUARD (Free tier protection) ----
-    if "gemini_calls_made" not in st.session_state:
-        st.session_state["gemini_calls_made"] = 0
-
-    MAX_GEMINI_CALLS = 3  # free tier safe limit per session
-
-    if st.session_state["gemini_calls_made"] >= MAX_GEMINI_CALLS:
-        return {
-            "explanation": (
-                "This insight is shown using rule‑based interpretation because "
-                "the daily AI explanation limit has been reached.\n\n"
-                "The guidance below is still accurate and derived from your "
-                "calculated chart."
-            ),
-            "raw_data": data,
-            "ai_generated": False,
-            "quota_exceeded": True
-        }
-
-    # ---- Streamlit cache to avoid repeated Gemini calls ----
-    cache_key = f"gemini_{analysis_type}"
+    cache_key = f"ai_{analysis_type}"
     if cache_key in st.session_state:
         return st.session_state[cache_key]
 
-    if not client:
-        print("[DEBUG] No Gemini client available. Falling back to rule-based explanation.")
-        return {
-            "explanation": (
-                "This explanation is generated using rule-based logic because "
-                "Gemini AI is currently unavailable."
-            ),
-            "raw_data": data,
-            "ai_generated": False
-        }
+    md = data.get("dasha", {}).get("mahadasha", {})
+    md_planet = md.get("planet")
 
-    # ---------- BUILD A COMPACT FACT SUMMARY FOR GEMINI ----------
+    md_house = kundli["planets"].get(md_planet, {}).get("house", "Unknown")
+    md_rashi = kundli["planets"].get(md_planet, {}).get("rashi", "Unknown")
+
     facts = f"""
-ASTROLOGICAL FACTS (ALREADY CALCULATED – DO NOT RE-CALCULATE):
-
 Ascendant (Lagna): {kundli['lagna']['rashi']}
 Moon Sign: {kundli['planets']['Moon']['rashi']}
 
-PLANETARY PLACEMENTS (House : Planets):
-"""    
+Current Mahadasha:
+- Planet: {md_planet}
+- Placement House: {md_house}
+- Sign Placement: {md_rashi}
 
-    for house, planets in kundli["houses"].items():
-        if planets:
-            names = ", ".join(p["planet"] for p in planets)
-            facts += f"\nHouse {house}: {names}"
+10th House (Career): {get_house_summary(kundli, 10)}
+7th House (Marriage): {get_house_summary(kundli, 7)}
+1st House (Self): {get_house_summary(kundli, 1)}
 
-    facts += f"""
-
-CURRENT DASHA:
-Mahadasha: {data.get('dasha', {}).get('mahadasha', {}).get('planet', 'N/A')}
-
-DOSHAS DETECTED:
-"""
-    doshas = data.get("doshas", [])
-    if doshas:
-        for d in doshas:
-            facts += f"\n- {d['name']} (Severity: {d['severity']})"
-    else:
-        facts += "\n- None"
-
-    if analysis_type == "career":
-        instruction = """
-TASK:
-Explain the person’s CAREER situation like a calm, experienced human astrologer
-talking to a client face‑to‑face.
-
-STYLE RULES:
-• No technical jargon
-• No predictions like “you WILL become”
-• Speak gently, practically, and clearly
-• 6–8 short sentences
-• Mention current phase, challenges, strengths, and next 6–12 months
-• End with ONE simple real‑life suggestion
-
-IMPORTANT:
-You are NOT calculating anything.
-You are ONLY explaining the facts above.
+Detected Doshas:
+{", ".join(d['name'] for d in data.get('doshas', [])) or "None"}
 """
 
-    elif analysis_type == "dosha_summary":
-        instruction = """
-TASK:
-Explain the detected doshas in reassuring, everyday language.
-
-STYLE RULES:
-• Do NOT scare the user
-• Explain doshas as tendencies, not fate
-• Mention that time + awareness reduces impact
-• 5–6 sentences maximum
-• Tone: calm, supportive, human
-
-IMPORTANT:
-You are NOT predicting events.
-You are ONLY explaining the facts above.
-"""
-
-    elif analysis_type == "personality":
-        instruction = """
-TASK:
-Explain personality traits based on Lagna and Moon sign.
-
-STYLE:
-• Warm, human, relatable
-• 6–7 short sentences
-• Strengths + natural tendencies
-• Avoid labels or destiny talk
-"""
-
-    elif analysis_type == "marriage":
-        instruction = """
-TASK:
-Explain relationship and marriage tendencies.
-
-STYLE:
-• Reassuring, practical
-• 6–7 sentences
-• Mention emotional patterns, communication, patience
-"""
-
-    elif analysis_type == "life_phase":
-        instruction = """
-TASK:
-Explain the current life phase based on active Mahadasha.
-
-STYLE:
-• Calm guidance
-• 5–6 sentences
-• What this phase teaches, not predicts
-"""
-
-    elif analysis_type == "strengths_challenges":
-        instruction = """
-TASK:
-Explain strengths and challenges shown in the chart.
-
-STYLE:
-• Balanced tone
-• Strengths first, challenges second
-• Encourage awareness and effort
-"""
-
-    elif analysis_type == "health":
-        instruction = """
-TASK:
-Explain health and energy patterns.
-
-STYLE:
-• Gentle, non-medical
-• Energy levels, stress tendencies
-• Avoid disease prediction
-"""
-
-    elif analysis_type == "spiritual":
-        instruction = """
-TASK:
-Explain spiritual growth and inner development.
-
-STYLE:
-• Reflective and grounding
-• 5–6 sentences
-• Focus on awareness and balance
-"""
-
-    else:
-        return {
-            "explanation": "Explanation unavailable for this section.",
-            "raw_data": data,
-            "ai_generated": False
-        }
+    instruction_map = {
+        "career": "Explain career direction calmly and practically.",
+        "marriage": "Explain relationship and marriage tendencies gently.",
+        "life_phase": "Explain the current life phase as guidance.",
+        "strengths_challenges": "Explain strengths first, then challenges.",
+        "health": "Explain energy and health patterns non-medically.",
+        "spiritual": "Explain spiritual growth and awareness.",
+        "dosha_summary": "Explain doshas as tendencies, not fear.",
+        "personality": "Explain personality traits warmly."
+    }
 
     prompt = f"""
-You are a calm, experienced human Vedic astrology guide.
-Speak warmly and practically, like talking to a friend.
+You are a calm, thoughtful human guide.
 
+IMPORTANT:
+- You do NOT calculate astrology.
+- You ONLY interpret the verified facts below.
+- Do NOT give generic advice.
+
+FACTS (already calculated):
 {facts}
 
-{instruction}
+TASK:
+Create a detailed, person-specific summary for: {analysis_type}
+
+You MUST follow this structure strictly:
+
+1. Core Influence
+- Identify the single most dominant planet, house, or dasha influencing this area.
+- Explain clearly WHY this factor is dominant right now.
+
+2. How It Manifests in Real Life
+- Explain how this influence shows up in daily life, decisions, emotions, or situations.
+- Connect house placement with the current dasha timing.
+
+3. Why It Feels This Way Now
+- Explain why this is a phase and not permanent.
+- Mention timing, maturity, or progression.
+
+4. Practical Direction
+- What works well during this phase.
+- What should be avoided.
+- Keep advice grounded and realistic.
+
+STYLE RULES:
+- Write as if guiding ONE real person
+- Use cause → effect reasoning
+- No astrology jargon without explanation
+- No fear, superstition, or guarantees
+- 3–4 medium paragraphs
+- Warm, human, confident tone
 """
 
     try:
-        print("[DEBUG] Calling Gemini API for analysis type: " + analysis_type)
-        print("[DEBUG] Using model: gemini-3-flash-preview (official docs safe)")
+        completion = hf_client.chat.completions.create(
+            model="HuggingFaceH4/zephyr-7b-beta:featherless-ai",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=350,
+            temperature=0.7,
+        )
 
-        # ---- BATCHING / QUOTA COUNT ----
-        st.session_state["gemini_calls_made"] += 1
-
-        # Use Gemini 3 Flash Preview model (official docs safe) with retry
-        import time
-        try:
-            response = client.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt
-            )
-        except Exception as first_error:
-            print("[WARN] Gemini temporary failure, retrying once...")
-            time.sleep(2)
-            response = client.models.generate_content(
-                model="gemini-3-flash-preview",
-                contents=prompt
-            )
-
-        print(f"[DEBUG] Gemini response received: {len(response.text)} characters")
+        text = completion.choices[0].message.content.strip()
 
         result = {
-            "explanation": response.text.strip(),
-            "raw_data": data,
+            "explanation": text,
             "ai_generated": True,
-            "model": "gemini-3-flash-preview"
+            "model": "zephyr-7b-beta (HF hosted)"
         }
-        st.session_state[cache_key] = result
-        return result
 
-    except Exception as e:
-        print(f"[ERROR] Gemini API call failed: {type(e).__name__}: {str(e)}")
-        import traceback
-        print(f"[ERROR] Full traceback: {traceback.format_exc()}")
-        fallback = {
-            "explanation": (
-                "This explanation is generated using rule-based logic because "
-                "Gemini AI is temporarily unavailable.\n\n"
-                "Based on your chart, the current period reflects responsibility, "
-                "learning, and gradual progress. Results improve with consistency "
-                "over the next few months. Any doshas indicate areas needing patience, "
-                "not fear."
+    except Exception:
+        # Graceful rule-based fallback (no AI)
+        fallback_map = {
+            "career": (
+                "Your chart suggests a steady career path influenced by your current dasha. "
+                "Progress may feel gradual, but consistency and skill-building will bring results. "
+                "Avoid impulsive decisions during emotionally charged periods."
             ),
-            "raw_data": data,
-            "ai_generated": False,
-            "error": str(e)
+            "marriage": (
+                "Relationships in your chart emphasize patience and mutual understanding. "
+                "Emotional maturity plays a key role in long-term harmony, especially during "
+                "challenging dashas."
+            ),
+            "life_phase": (
+                "This phase of life appears focused on learning, adjustment, and inner growth. "
+                "It is a time to build foundations rather than expect instant outcomes."
+            ),
+            "strengths_challenges": (
+                "Your strengths include adaptability and long-term vision. "
+                "Challenges mainly arise from overthinking or delayed action. "
+                "Balance planning with timely execution."
+            ),
+            "health": (
+                "Overall energy patterns indicate the importance of routine and balance. "
+                "Mental rest and disciplined habits support well-being during demanding periods."
+            ),
+            "spiritual": (
+                "Spiritual growth in your chart comes through self-reflection and awareness. "
+                "Periods of silence or introspection can be especially beneficial."
+            ),
+            "dosha_summary": (
+                "The detected doshas indicate tendencies rather than fixed outcomes. "
+                "Their impact reduces with awareness, right timing, and conscious effort."
+            ),
+            "personality": (
+                "Your personality shows a thoughtful and observant nature. "
+                "You tend to learn from experience and grow stronger through reflection."
+            ),
         }
-        st.session_state[cache_key] = fallback
-        return fallback
+
+        result = {
+            "explanation": fallback_map.get(
+                analysis_type,
+                "This insight is shown using rule-based interpretation based on your chart."
+            ),
+            "ai_generated": False,
+            "model": "rule-based fallback"
+        }
+
+    st.session_state[cache_key] = result
+    return result
 
 def get_house_summary(kundli, house_num):
     """
@@ -291,7 +196,7 @@ def render_ai_insight(title, analysis_type, data, kundli, expanded=False):
     """
     Renders a single AI insight section with:
     - Spinner
-    - Gemini explanation
+    - AI explanation
     - Red highlighted output
     """
     with st.expander(title, expanded=expanded):
@@ -312,7 +217,7 @@ def render_ai_insight(title, analysis_type, data, kundli, expanded=False):
                 font-size: 1rem;
                 line-height: 1.6;
             ">
-            <strong>🤖 Gemini Explanation</strong><br><br>
+            <strong>🤖 AI Explanation</strong><br><br>
             {insight['explanation']}
             </div>
             """,
@@ -864,13 +769,11 @@ Current Mahadasha: {maha['planet']} ({maha['start_date']} to {maha['end_date']})
         st.subheader("🤖 AI-Powered Insights")
 
         st.warning("""
-⚠️ **AI Usage Notice**
+⚠️ AI Usage Notice
 
-Gemini AI has a **daily free‑tier limit**.
-Only the **most important insights** are generated using AI.
-
-Other insights automatically fall back to **rule‑based human explanations**
-to keep the app fast, stable, and reliable.
+This section uses an open-source AI model (OpenHermes).
+The AI does NOT calculate planets, doshas, or dashas.
+It only explains already-calculated results in simple language.
 """)
 
         render_ai_insight(
@@ -930,7 +833,7 @@ to keep the app fast, stable, and reliable.
             kundli
         )
 
-        st.caption("🧠 Gemini explains only — all astrology is rule-based and reproducible.")
+        st.caption("🧠 AI explains only — all astrology is rule-based and reproducible.")
 
 else:
     # Welcome screen
