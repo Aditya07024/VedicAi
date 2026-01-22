@@ -2,6 +2,8 @@
 
 An intelligent Vedic astrology platform that generates detailed Kundli (birth charts), analyzes planetary doshas, and provides personalized astrological insights using AI-powered analysis.
 
+🌐 **Live App:** https://vedicai.onrender.com/  
+
 ## Overview
 
 VedicAi combines ancient Vedic astrological principles with modern artificial intelligence to provide accurate and meaningful astrological readings. The platform calculates precise planetary positions using Swiss Ephemeris data, analyzes astrological doshas (afflictions), and generates comprehensive Kundli charts with AI-powered interpretations.
