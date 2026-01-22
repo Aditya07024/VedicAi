@@ -260,27 +260,27 @@ st.markdown(
 )
 
 # Centered GitHub button just below banner
-st.markdown(
-    """
-    <div style="text-align:center; margin-bottom: 2rem;">
-        <a href="https://github.com/Aditya07024" target="_blank">
-            <button style="
-                background-color:#dc2626;
-                color:white;
-                border:none;
-                padding:14px 22px;
-                font-size:1rem;
-                border-radius:10px;
-                cursor:pointer;
-                font-weight:600;
-            ">
-                📘 How to Use This App
-            </button>
-        </a>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+# st.markdown(
+#     """
+#     <div style="text-align:center; margin-bottom: 2rem;">
+#         <a href="https://github.com/Aditya07024" target="_blank">
+#             <button style="
+#                 background-color:#dc2626;
+#                 color:white;
+#                 border:none;
+#                 padding:14px 22px;
+#                 font-size:1rem;
+#                 border-radius:10px;
+#                 cursor:pointer;
+#                 font-weight:600;
+#             ">
+#                 📘 How to Use This App
+#             </button>
+#         </a>
+#     </div>
+#     """,
+#     unsafe_allow_html=True
+# )
 
 # Sidebar - Input Form
 with st.sidebar:
